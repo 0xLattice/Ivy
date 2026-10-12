@@ -21,7 +21,9 @@ sessions sit above the stream and are the same for all of them. Dialing an
 address taken from routing is TCP only.
 
 Inbound capacity is reserved by global and netgroup limits, keyed on the
-observed address, before anything is requested from a stream. A rejected stream
+observed address, before anything is requested from a stream. A reservation
+admits one stream of the netgroup it was reserved for, and a stream that
+reports no observed address is refused. A rejected stream
 is never read, so it cannot buffer protocol input while waiting for the Ivy
 actor. Capacity is a hard cap: Ivy rejects excess peers rather than evicting
 an authenticated connection by reputation.
