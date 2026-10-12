@@ -12,6 +12,7 @@ public enum IvyError: Error, Sendable, Equatable {
     case connectionInProgress
     case identityVerificationFailed
     case noRelayAvailable
+    case streamHasNoObservedHost
 }
 
 struct PendingNeighborResponse: Sendable {
@@ -550,21 +551,30 @@ public actor Ivy {
     /// Reserves inbound admission for a peer observed at `observedHost`, or
     /// returns nil when the node is not accepting it. A supplier of inbound
     /// streams calls this before it spends anything on the peer, then hands
-    /// the stream to `accept(_:admission:)`.
+    /// the stream to `accept(_:admission:)`. `observedHost` must be the host
+    /// the stream will report: the lease admits only a stream of the netgroup
+    /// it was reserved for. A peer with no observed host is not admitted.
     public nonisolated func reserveInboundAdmission(
         observedHost: String?
     ) -> InboundAdmissionLease? {
-        inboundAdmissionGate.current?.reserve(observedHost: observedHost)
+        guard let observedHost, !observedHost.isEmpty else { return nil }
+        return inboundAdmissionGate.current?.reserve(observedHost: observedHost)
     }
 
     /// Accepts a stream the caller established, with this node as the
     /// responder. Nothing is requested from the stream until the node has
-    /// admitted it; a stream that is not admitted is closed.
+    /// admitted it. Refusal is reported only by closing the stream.
     public nonisolated func accept(
         _ stream: any TransportConnection,
         admission: InboundAdmissionLease
     ) {
         guard admission.claim() else {
+            stream.close()
+            return
+        }
+        guard let host = stream.observedHost, !host.isEmpty,
+              admission.netgroup == NetGroup.group(host) else {
+            admission.release()
             stream.close()
             return
         }
@@ -575,7 +585,9 @@ public actor Ivy {
             inboundByteBudget: inboundByteBudget,
             maxFrameSize: config.protocolMaxFrameSize)
         Task { [weak self] in
-            guard let self else {
+            guard let self,
+                  let gate = admission.gate,
+                  gate === self.inboundAdmissionGate.current else {
                 connection.cancel()
                 return
             }
@@ -585,7 +597,7 @@ public actor Ivy {
 
     /// Connects to `endpoint` over a stream the caller established, with this
     /// node as the initiator. The stream is closed unless it becomes the
-    /// peer's session.
+    /// peer's session, and it must report the host its peer was observed at.
     public func connect(
         to endpoint: PeerEndpoint,
         over stream: any TransportConnection
@@ -595,6 +607,9 @@ public actor Ivy {
             reconnectSuppressed.remove(key.peerID)
             guard config.allowsEndpoint(key) else { throw IvyError.peerOutsideMode }
             guard running, !Task.isCancelled else { throw IvyError.notRunning }
+            guard let host = stream.observedHost, !host.isEmpty else {
+                throw IvyError.streamHasNoObservedHost
+            }
             let connected = try await connectDirect(
                 to: endpoint,
                 key: key,
@@ -716,11 +731,13 @@ public actor Ivy {
             if connected { return true }
             throw error
         }
+        // A supplied stream's address is not one Ivy can dial, so it is kept
+        // out of the connection's endpoint and so out of routing.
         let connection = PeerConnection.direct(
             endpoint: PeerEndpoint(
                 publicKey: key.hex,
-                host: rewritten.host,
-                port: rewritten.port),
+                host: supplied == nil ? rewritten.host : "unknown",
+                port: supplied == nil ? rewritten.port : 0),
             stream: stream,
             inboundByteBudget: inboundByteBudget,
             maxFrameSize: config.protocolMaxFrameSize)

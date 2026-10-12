@@ -26,7 +26,11 @@ final class InboundAdmissionGate: @unchecked Sendable {
             }
             count += 1
             countsByNetgroup[netgroup, default: 0] += 1
-            return InboundAdmissionLease(generation: generation) { [weak self] in
+            return InboundAdmissionLease(
+                gate: self,
+                netgroup: netgroup,
+                generation: generation
+            ) { [weak self] in
                 self?.release(netgroup: netgroup)
             }
         }
@@ -72,10 +76,20 @@ public final class InboundAdmissionLease: @unchecked Sendable {
     private let lock = NSLock()
     private var releaseAction: (() -> Void)?
     private var claimed = false
-    /// The run whose gate issued this lease; a lease does not outlive it.
+    /// The gate that issued this lease and the netgroup it counted; a lease
+    /// admits only a stream of that netgroup, into that gate's run.
+    private(set) weak var gate: InboundAdmissionGate?
+    let netgroup: String
     let generation: UInt64
 
-    init(generation: UInt64 = 0, release: @escaping () -> Void) {
+    init(
+        gate: InboundAdmissionGate,
+        netgroup: String,
+        generation: UInt64,
+        release: @escaping () -> Void
+    ) {
+        self.gate = gate
+        self.netgroup = netgroup
         self.generation = generation
         releaseAction = release
     }
@@ -352,6 +366,9 @@ final class PeerConnection: @unchecked Sendable {
             localMaxFrameSize: maxFrameSize)
         connection.observedHost = stream.observedHost
         stream.attach(connection)
+        // Changes are reported only from `attach` on; one that came between
+        // the sample taken at init and here is picked up now.
+        connection.channelWritabilityChanged(isWritable: stream.isWritable)
         return connection
     }
 
@@ -652,7 +669,8 @@ final class SessionFrameDecoder: @unchecked Sendable {
     func receive(_ bytes: Data) {
         perform(lock.withLock {
             var effects = Effects()
-            guard !finished else { return effects }
+            // An empty delivery carries nothing: the request stays outstanding.
+            guard !finished, !bytes.isEmpty else { return effects }
             guard readOutstanding else {
                 fail(&effects)
                 return effects

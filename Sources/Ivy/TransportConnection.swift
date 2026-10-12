@@ -3,10 +3,13 @@ import Foundation
 /// Receives everything a `TransportConnection` produces. Calls arrive one at a
 /// time, in stream order.
 public protocol TransportConnectionSink: AnyObject, Sendable {
-    /// The bytes one `requestBytes()` asked for, in stream order.
+    /// The bytes one `requestBytes()` asked for, in stream order: never empty,
+    /// and no more than one read of the stream's own. Ivy holds a delivery
+    /// unreserved until it is decoded, so that read size is what bounds it.
     func transportDidReceive(_ bytes: Data)
     func transportWritabilityChanged(isWritable: Bool)
-    /// The stream ended, whichever side closed it. Nothing follows.
+    /// The stream ended, whichever side closed it. Reported exactly once;
+    /// nothing follows.
     func transportDidClose()
 }
 
@@ -17,15 +20,17 @@ public protocol TransportConnectionSink: AnyObject, Sendable {
 /// this protocol and are the same for every stream. Whoever established the
 /// stream hands it to `Ivy.accept(_:admission:)` or `Ivy.connect(to:over:)`.
 public protocol TransportConnection: AnyObject, Sendable {
-    /// Address the peer was observed at, which netgroup admission keys on.
+    /// Address the peer was observed at, which netgroup admission keys on. A
+    /// stream must report one: Ivy refuses a stream without it.
     var observedHost: String? { get }
     /// Local address the stream is bound to, if it has one.
     var localHost: String? { get }
     var isActive: Bool { get }
     var isWritable: Bool { get }
 
-    /// Installs the sink, which the stream holds until it has reported its
-    /// close. A stream that already closed reports that at once.
+    /// Installs the sink. The stream holds it until it has reported its close
+    /// and drops it then: the connection and its stream hold each other until
+    /// it does. A stream that already closed reports that at once.
     func attach(_ sink: any TransportConnectionSink)
 
     /// Asks for the next bytes. Each call permits one `transportDidReceive`,
@@ -38,6 +43,7 @@ public protocol TransportConnection: AnyObject, Sendable {
     /// writable are still queued; `isWritable` is the signal to stop.
     func send(_ bytes: Data)
 
-    /// Closes the stream. The sink is told through `transportDidClose()`.
+    /// Closes the stream. May be called more than once; the sink is told
+    /// through `transportDidClose()` exactly once.
     func close()
 }
