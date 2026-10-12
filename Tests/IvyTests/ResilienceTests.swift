@@ -79,7 +79,7 @@ struct ResilienceTests {
                 host: "127.0.0.1",
                 port: loopback.port
             ),
-            channel: loopback.client)
+            stream: NIOTransportConnection(channel: loopback.client))
 
         connection.channelWritabilityChanged(isWritable: false)
         #expect(connection.sendSerializedRecord(Data([1, 2, 3])) == .backpressured)
@@ -107,7 +107,7 @@ struct ResilienceTests {
         let remote = try PeerKey(deterministicTestPeerKey("outbound-remote"))
         let endpoint = PeerEndpoint(publicKey: remote.hex, host: "127.0.0.1", port: 4001)
         let loopback = try await TestLoopback.open()
-        let connection = PeerConnection(endpoint: endpoint, channel: loopback.client)
+        let connection = PeerConnection(endpoint: endpoint, stream: NIOTransportConnection(channel: loopback.client))
         let ivy = Ivy(config: IvyConfig(signingKey: local, stunServers: []))
         try await ivy.seedConnectedEndpointForTesting(endpoint, connection: connection, marker: 1)
 
@@ -136,7 +136,7 @@ struct ResilienceTests {
         let remote = try PeerKey(deterministicTestPeerKey("burst-remote"))
         let endpoint = PeerEndpoint(publicKey: remote.hex, host: "127.0.0.1", port: 4001)
         let loopback = try await TestLoopback.open()
-        let connection = PeerConnection(endpoint: endpoint, channel: loopback.client)
+        let connection = PeerConnection(endpoint: endpoint, stream: NIOTransportConnection(channel: loopback.client))
         let ivy = Ivy(config: IvyConfig(
             signingKey: local,
             tallyConfig: TallyConfig(
@@ -163,7 +163,7 @@ struct ResilienceTests {
         let remote = try PeerKey(deterministicTestPeerKey("reply-wait-remote"))
         let endpoint = PeerEndpoint(publicKey: remote.hex, host: "127.0.0.1", port: 4001)
         let loopback = try await TestLoopback.open()
-        let connection = PeerConnection(endpoint: endpoint, channel: loopback.client)
+        let connection = PeerConnection(endpoint: endpoint, stream: NIOTransportConnection(channel: loopback.client))
         let ivy = Ivy(config: IvyConfig(signingKey: local, stunServers: []))
         try await ivy.seedConnectedEndpointForTesting(endpoint, connection: connection, marker: 1)
         let content = Data(repeating: 7, count: 1_000)

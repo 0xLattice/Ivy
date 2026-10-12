@@ -117,13 +117,13 @@ struct InboundAdmissionTests {
         try await oldChannel.connect(to: SocketAddress(ipAddress: "10.1.0.1", port: 4001)).get()
         try await occupyingChannel.connect(to: SocketAddress(ipAddress: "10.2.0.1", port: 4002)).get()
         try await replacementChannel.connect(to: SocketAddress(ipAddress: "10.2.0.2", port: 4003)).get()
-        let oldConnection = PeerConnection(endpoint: replacedEndpoint, channel: oldChannel)
+        let oldConnection = PeerConnection(endpoint: replacedEndpoint, stream: NIOTransportConnection(channel: oldChannel))
         oldConnection.observedHost = "10.1.0.1"
         let occupyingConnection = PeerConnection(
             endpoint: occupyingEndpoint,
-            channel: occupyingChannel)
+            stream: NIOTransportConnection(channel: occupyingChannel))
         occupyingConnection.observedHost = "10.2.0.1"
-        let replacement = PeerConnection(endpoint: replacedEndpoint, channel: replacementChannel)
+        let replacement = PeerConnection(endpoint: replacedEndpoint, stream: NIOTransportConnection(channel: replacementChannel))
         replacement.observedHost = "10.2.0.2"
         try await node.seedConnectedEndpointForTesting(
             replacedEndpoint,

@@ -178,7 +178,7 @@ public actor Ivy {
     var running = false
     private var lifecycleTail: Task<Void, Never>?
     var runGeneration: UInt64 = 0
-    private var inboundAdmissionGate: InboundAdmissionGate?
+    private nonisolated let inboundAdmissionGate = CurrentInboundAdmissionGate()
 
     let stunClient: STUNClient
     private var publicAddressDiscoveryTask: Task<Void, Never>?
@@ -285,7 +285,7 @@ public actor Ivy {
 #endif
         let listener = try await startListener(generation: generation)
         serverChannel = listener.channel
-        inboundAdmissionGate = listener.gate
+        inboundAdmissionGate.replace(with: listener.gate)
         running = true
         publicAddressDiscoveryTask?.cancel()
         publicAddressDiscoveryTask = nil
@@ -374,8 +374,7 @@ public actor Ivy {
         running = false
         publicAddressDiscoveryTask?.cancel()
         publicAddressDiscoveryTask = nil
-        inboundAdmissionGate?.invalidate()
-        inboundAdmissionGate = nil
+        inboundAdmissionGate.replace(with: nil)?.invalidate()
         routingRefreshTimer?.cancel()
         routingRefreshTimer = nil
         await healthMonitor?.stopMonitoring()
@@ -548,6 +547,73 @@ public actor Ivy {
         }
     }
 
+    /// Reserves inbound admission for a peer observed at `observedHost`, or
+    /// returns nil when the node is not accepting it. A supplier of inbound
+    /// streams calls this before it spends anything on the peer, then hands
+    /// the stream to `accept(_:admission:)`.
+    public nonisolated func reserveInboundAdmission(
+        observedHost: String?
+    ) -> InboundAdmissionLease? {
+        inboundAdmissionGate.current?.reserve(observedHost: observedHost)
+    }
+
+    /// Accepts a stream the caller established, with this node as the
+    /// responder. Nothing is requested from the stream until the node has
+    /// admitted it; a stream that is not admitted is closed.
+    public nonisolated func accept(
+        _ stream: any TransportConnection,
+        admission: InboundAdmissionLease
+    ) {
+        guard admission.claim() else {
+            stream.close()
+            return
+        }
+        let connection = PeerConnection.direct(
+            endpoint: PeerEndpoint(publicKey: "", host: "unknown", port: 0),
+            stream: stream,
+            inboundAdmission: admission,
+            inboundByteBudget: inboundByteBudget,
+            maxFrameSize: config.protocolMaxFrameSize)
+        Task { [weak self] in
+            guard let self else {
+                connection.cancel()
+                return
+            }
+            await self.registerInboundConnection(connection, generation: admission.generation)
+        }
+    }
+
+    /// Connects to `endpoint` over a stream the caller established, with this
+    /// node as the initiator. The stream is closed unless it becomes the
+    /// peer's session.
+    public func connect(
+        to endpoint: PeerEndpoint,
+        over stream: any TransportConnection
+    ) async throws {
+        do {
+            guard let key = try? PeerKey(endpoint.publicKey) else { throw IvyError.invalidPeerKey }
+            reconnectSuppressed.remove(key.peerID)
+            guard config.allowsEndpoint(key) else { throw IvyError.peerOutsideMode }
+            guard running, !Task.isCancelled else { throw IvyError.notRunning }
+            let connected = try await connectDirect(
+                to: endpoint,
+                key: key,
+                role: .endpoint,
+                generation: runGeneration,
+                over: stream)
+            if sessions[key]?.connection.stream !== stream { stream.close() }
+            guard connected else {
+                if outgoingDials[key.peerID] != nil || pendingPeerConnectionWaiters[key] != nil {
+                    throw IvyError.connectionInProgress
+                }
+                throw IvyError.identityVerificationFailed
+            }
+        } catch {
+            stream.close()
+            throw error
+        }
+    }
+
     func connectEndpointIfAdmitted(
         to routes: [PeerEndpoint],
         requiredGeneration: UInt64? = nil
@@ -607,7 +673,8 @@ public actor Ivy {
         to endpoint: PeerEndpoint,
         key: PeerKey,
         role: AuthenticatedPeerRole,
-        generation: UInt64
+        generation: UInt64,
+        over supplied: (any TransportConnection)? = nil
     ) async throws -> Bool {
         guard !reconnectSuppressed.contains(key.peerID) else { return false }
         if sessions[key]?.role == role,
@@ -627,16 +694,16 @@ public actor Ivy {
 #else
         let rewritten = canonical
 #endif
-        let connection: PeerConnection
+        let stream: any TransportConnection
         do {
-            connection = try await PeerConnection.dial(
-                endpoint: PeerEndpoint(
-                    publicKey: key.hex,
+            if let supplied {
+                stream = supplied
+            } else {
+                stream = try await NIOTransportConnection.dial(
                     host: rewritten.host,
-                    port: rewritten.port),
-                group: group,
-                inboundByteBudget: inboundByteBudget,
-                maxFrameSize: config.protocolMaxFrameSize)
+                    port: rewritten.port,
+                    group: group)
+            }
         } catch {
             let connected = await finishOutgoingDialOrAwaitCompetingResponder(
                 for: key,
@@ -649,6 +716,14 @@ public actor Ivy {
             if connected { return true }
             throw error
         }
+        let connection = PeerConnection.direct(
+            endpoint: PeerEndpoint(
+                publicKey: key.hex,
+                host: rewritten.host,
+                port: rewritten.port),
+            stream: stream,
+            inboundByteBudget: inboundByteBudget,
+            maxFrameSize: config.protocolMaxFrameSize)
         guard bindOutgoingDial(
             to: key.peerID,
             generation: generation,
@@ -1141,23 +1216,17 @@ public actor Ivy {
 
     private func startInboundTask(_ connection: PeerConnection) {
         let task: Task<Void, Never>
-        if let directInbound = connection.directInboundStream {
+        if let decoder = connection.frameDecoder {
             task = Task { [weak self, weak connection] in
                 guard let connection else { return }
-                do {
-                    try await directInbound.executeThenClose { inbound in
-                        for try await frame in inbound {
-                            guard let self,
-                                  !Task.isCancelled,
-                                  connection.isLive else { return }
-                            await self.handleSessionRecord(frame.bytes, on: connection)
-                            withExtendedLifetime(frame) {}
-                        }
-                    }
-                    if connection.isLive { connection.cancel() }
-                } catch {
-                    connection.cancel()
+                while let frame = await decoder.next() {
+                    guard let self,
+                          !Task.isCancelled,
+                          connection.isLive else { break }
+                    await self.handleSessionRecord(frame.bytes, on: connection)
+                    withExtendedLifetime(frame) {}
                 }
+                if connection.isLive { connection.cancel() }
             }
         } else {
             let records = connection.records
@@ -1174,6 +1243,7 @@ public actor Ivy {
             guard let self, let connection else { return }
             Task { await self.connectionEnded(connection) }
         }
+        connection.startReading()
     }
 
     private func handleSessionRecord(_ bytes: Data, on connection: PeerConnection) async {
@@ -1326,7 +1396,7 @@ public actor Ivy {
     private func localMetadata(for connection: PeerConnection) -> PeerMetadata {
         PeerMetadata(
             listenAddresses: advertisedListenAddresses(
-                observedLocalHost: connection.channel?.localAddress?.ipAddress),
+                observedLocalHost: connection.stream?.localHost),
             maxFrameSize: config.protocolMaxFrameSize)
     }
 
@@ -3363,34 +3433,21 @@ public actor Ivy {
     ) async throws -> (channel: Channel, gate: InboundAdmissionGate) {
         let gate = InboundAdmissionGate(
             maxConnections: config.maxInboundConnections,
-            maxConnectionsPerNetgroup: config.maxConnectionsPerNetgroup)
-        let inboundByteBudget = self.inboundByteBudget
+            maxConnectionsPerNetgroup: config.maxConnectionsPerNetgroup,
+            generation: generation)
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(.backlog, value: 256)
             .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
             .childChannelOption(ChannelOptions.autoRead, value: false)
             .childChannelInitializer { [weak self] channel in
                 guard let self else { return channel.close() }
-                let connectionBudget = InboundByteBudget(
-                    limit: PeerConnection.inboundByteBudgetLimit(for: self.config.protocolMaxFrameSize))
                 do {
-                    try channel.pipeline.syncOperations.addHandler(SessionFrameDecoder(
-                        maxFrameSize: self.config.protocolMaxFrameSize,
-                        budget: inboundByteBudget,
-                        connectionBudget: connectionBudget))
-                    let directInbound = try NIOAsyncChannel<InboundFrame, Never>(
-                        wrappingChannelSynchronously: channel,
-                        configuration: .init(backPressureStrategy: .init(
-                            lowWatermark: 1,
-                            highWatermark: 1)))
+                    let connection = NIOTransportConnection(channel: channel)
+                    try channel.pipeline.syncOperations.addHandler(connection)
                     let acceptor = InboundConnectionAcceptor(
                         ivy: self,
-                        generation: generation,
                         admissionGate: gate,
-                        inboundByteBudget: inboundByteBudget,
-                        connectionInboundByteBudget: connectionBudget,
-                        directInbound: directInbound,
-                        localMaxFrameSize: self.config.protocolMaxFrameSize)
+                        connection: connection)
                     return channel.pipeline.addHandler(acceptor)
                 } catch {
                     return channel.eventLoop.makeFailedFuture(error)

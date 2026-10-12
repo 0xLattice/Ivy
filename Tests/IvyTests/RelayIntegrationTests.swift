@@ -35,7 +35,7 @@ struct RelayIntegrationTests {
         let carrierChannel = EmbeddedChannel()
         try await carrierChannel.connect(
             to: SocketAddress(ipAddress: "127.0.0.1", port: 4001)).get()
-        let carrierConnection = PeerConnection(endpoint: carrierEndpoint, channel: carrierChannel)
+        let carrierConnection = PeerConnection(endpoint: carrierEndpoint, stream: NIOTransportConnection(channel: carrierChannel))
         carrierConnection.peerMaxFrameSize = 4 * 1024 * 1024
         try await node.seedConnectedEndpointForTesting(
             carrierEndpoint,
@@ -98,7 +98,7 @@ struct RelayIntegrationTests {
         let carrierKey = TransportTestHarness.key(carrierIdentity)
         let channel = EmbeddedChannel()
         try await channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 4001)).get()
-        let connection = PeerConnection(endpoint: carrierEndpoint, channel: channel)
+        let connection = PeerConnection(endpoint: carrierEndpoint, stream: NIOTransportConnection(channel: channel))
         try await target.seedConnectedEndpointForTesting(
             carrierEndpoint,
             connection: connection,
@@ -143,7 +143,7 @@ struct RelayIntegrationTests {
             healthConfig: PeerHealthConfig(enabled: false)))
         let channel = EmbeddedChannel()
         try await channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 4001)).get()
-        let connection = PeerConnection(endpoint: carrierEndpoint, channel: channel)
+        let connection = PeerConnection(endpoint: carrierEndpoint, stream: NIOTransportConnection(channel: channel))
         try await target.seedConnectedEndpointForTesting(
             carrierEndpoint,
             connection: connection,
@@ -332,7 +332,7 @@ struct RelayIntegrationTests {
         for (index, endpoint) in endpoints.enumerated() {
             try await node.seedConnectedEndpointForTesting(
                 endpoint,
-                connection: PeerConnection(endpoint: endpoint, channel: loopbacks[index].client),
+                connection: PeerConnection(endpoint: endpoint, stream: NIOTransportConnection(channel: loopbacks[index].client)),
                 role: .carrier,
                 marker: UInt8(index + 1))
         }
@@ -377,7 +377,7 @@ struct RelayIntegrationTests {
             carriers: [endpoint]))
         try await node.seedConnectedEndpointForTesting(
             endpoint,
-            connection: PeerConnection(endpoint: endpoint, channel: loopback.client),
+            connection: PeerConnection(endpoint: endpoint, stream: NIOTransportConnection(channel: loopback.client)),
             role: .carrier,
             marker: 1)
         let connecting = Task {
@@ -557,7 +557,7 @@ struct RelayIntegrationTests {
             carriers: [carrierEndpoint]))
         try await node.seedConnectedEndpointForTesting(
             carrierEndpoint,
-            connection: PeerConnection(endpoint: carrierEndpoint, channel: loopback.client),
+            connection: PeerConnection(endpoint: carrierEndpoint, stream: NIOTransportConnection(channel: loopback.client)),
             role: .carrier,
             marker: 1)
         for marker in 1..<Ivy.maxRelayRoutes {
@@ -655,7 +655,7 @@ struct RelayIntegrationTests {
         for (index, endpoint) in endpoints.enumerated() {
             try await node.seedConnectedEndpointForTesting(
                 endpoint,
-                connection: PeerConnection(endpoint: endpoint, channel: loopbacks[index].client),
+                connection: PeerConnection(endpoint: endpoint, stream: NIOTransportConnection(channel: loopbacks[index].client)),
                 role: .carrier,
                 marker: UInt8(index + 1))
         }

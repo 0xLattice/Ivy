@@ -266,7 +266,7 @@ struct SessionProtocolTests {
         defer { _ = try? channel.finish() }
         let connection = PeerConnection(
             endpoint: PeerEndpoint(publicKey: remote.hex, host: "127.0.0.1", port: 4001),
-            channel: channel,
+            stream: NIOTransportConnection(channel: channel),
             inboundByteBudget: InboundByteBudget(limit: IvyConfig.defaultMaxInboundBufferedBytes))
         let metadata = try #require(PeerMetadata().encode())
         let matching = SessionHelloInitiator(
