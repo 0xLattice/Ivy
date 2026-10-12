@@ -1,6 +1,5 @@
 import Foundation
 import NIOCore
-import NIOEmbedded
 import NIOPosix
 import Testing
 @testable import Ivy
@@ -102,13 +101,12 @@ private func framed(_ records: [Data], allocator: ByteBufferAllocator) -> ByteBu
 /// One accepted server-side connection built with Ivy's inbound pipeline.
 private struct Accepted: @unchecked Sendable {
     let channel: Channel
-    let inbound: NIOAsyncChannel<InboundFrame, Never>
+    let connection: PeerConnection
     let decoder: SessionFrameDecoder
     let connectionBudget: InboundByteBudget
 
     func onPaused(_ report: @escaping @Sendable (Int) -> Void) async throws {
-        let decoder = decoder
-        try await channel.eventLoop.submit { decoder.onPausedForTesting = report }.get()
+        decoder.onPausedForTesting = report
     }
 
     /// Consumes `count` frames the way `Ivy.startInboundTask` does: each frame
@@ -118,24 +116,26 @@ private struct Accepted: @unchecked Sendable {
         gate: Latch?,
         firstReceived: Latch? = nil
     ) -> Task<[Data], Error> {
-        let inbound = inbound
-        return Task {
+        let decoder = decoder
+        let connection = connection
+        let task = Task<[Data], Error> {
             var received: [Data] = []
-            try await inbound.executeThenClose { frames in
-                for try await frame in frames {
-                    firstReceived?.open()
-                    await gate?.wait()
-                    received.append(frame.bytes)
-                    if received.count == count { break }
-                }
+            while let frame = await decoder.next() {
+                firstReceived?.open()
+                await gate?.wait()
+                received.append(frame.bytes)
+                if received.count == count { break }
             }
+            connection.cancel()
             return received
         }
+        connection.startReading()
+        return task
     }
 }
 
-/// A listener whose child pipeline matches `Ivy.startListener`: the session
-/// frame decoder under a `NIOAsyncChannel` with a high watermark of one.
+/// A listener whose child pipeline matches `Ivy.startListener`: a NIO-backed
+/// stream that reads only on request, under the session frame decoder.
 private struct Server {
     let listener: Channel
     let accepted: AsyncStream<Accepted>
@@ -146,23 +146,30 @@ private struct Server {
     ) async throws -> Server {
         let (accepted, continuation) = AsyncStream<Accepted>.makeStream()
         let listener = try await ServerBootstrap(group: MultiThreadedEventLoopGroup.singleton)
+            .childChannelOption(ChannelOptions.autoRead, value: false)
             .childChannelInitializer { channel in
                 let connectionBudget = InboundByteBudget(
                     limit: PeerConnection.inboundByteBudgetLimit(for: maxFrameSize))
+                let stream = NIOTransportConnection(channel: channel)
                 let decoder = SessionFrameDecoder(
                     maxFrameSize: maxFrameSize,
                     budget: budget,
-                    connectionBudget: connectionBudget)
+                    connectionBudget: connectionBudget,
+                    requestBytes: { stream.requestBytes() },
+                    close: { stream.close() })
                 do {
-                    try channel.pipeline.syncOperations.addHandler(decoder)
-                    let inbound = try NIOAsyncChannel<InboundFrame, Never>(
-                        wrappingChannelSynchronously: channel,
-                        configuration: .init(backPressureStrategy: .init(
-                            lowWatermark: 1,
-                            highWatermark: 1)))
+                    try channel.pipeline.syncOperations.addHandler(stream)
+                    let connection = PeerConnection(
+                        endpoint: PeerEndpoint(publicKey: "", host: "unknown", port: 0),
+                        stream: stream,
+                        decoder: decoder,
+                        inboundByteBudget: budget,
+                        connectionInboundByteBudget: connectionBudget,
+                        localMaxFrameSize: maxFrameSize)
+                    stream.attach(connection)
                     continuation.yield(Accepted(
                         channel: channel,
-                        inbound: inbound,
+                        connection: connection,
                         decoder: decoder,
                         connectionBudget: connectionBudget))
                     return channel.eventLoop.makeSucceededVoidFuture()
@@ -332,7 +339,7 @@ struct InboundBackpressureTests {
     }
 
     @Test("a paused decoder withholds socket reads and forwards one when budget frees")
-    func pausedDecoderWithholdsReads() throws {
+    func pausedDecoderWithholdsReads() async throws {
         let connectionBudget = InboundByteBudget(
             limit: PeerConnection.inboundByteBudgetLimit(for: maxFrameSize))
         let budget = InboundByteBudget(limit: IvyConfig.defaultMaxInboundBufferedBytes)
@@ -341,37 +348,38 @@ struct InboundBackpressureTests {
         let decoder = SessionFrameDecoder(
             maxFrameSize: maxFrameSize,
             budget: budget,
-            connectionBudget: connectionBudget)
-        var carryOver: [Int] = []
+            connectionBudget: connectionBudget,
+            requestBytes: { reads.requested() },
+            close: { reads.closed() })
+        let carryOver = PausedReports()
         decoder.onPausedForTesting = { carryOver.append($0) }
-        let channel = EmbeddedChannel()
-        try channel.pipeline.syncOperations.addHandler(reads)
-        try channel.pipeline.syncOperations.addHandler(decoder)
-        try channel.pipeline.syncOperations.addHandler(holder)
-        try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 4001)).wait()
+        decoder.start()
 
         let frames = (0..<3).map(frame)
-        try channel.writeInbound(framed(frames, allocator: channel.allocator))
-        #expect(channel.isActive)
+        let bytes = framed(frames, allocator: ByteBufferAllocator())
+        decoder.receive(Data(bytes.readableBytesView))
+        holder.take(from: decoder)
+        #expect(!reads.isClosed)
         #expect(holder.frames.map(\.bytes) == Array(frames.prefix(2)))
         // Two held frames; the third frame's body waits for budget.
         #expect(connectionBudget.currentUsage == 2 * Int(maxFrameSize))
-        #expect(carryOver == [Int(maxFrameSize)])
+        #expect(carryOver.values == [Int(maxFrameSize)])
 
+        // The request that follows the delivery is withheld while paused.
         let baseline = reads.count
-        channel.read()
-        #expect(reads.count == baseline)
+        #expect(baseline == 1)
 
         holder.releaseFirst()
-        channel.embeddedEventLoop.run()
+        try await TestSynchronization.wait(for: "withheld read") { reads.count > baseline }
+        holder.take(from: decoder)
         #expect(holder.delivered == frames)
         #expect(reads.count == baseline + 1)
-        #expect(channel.isActive)
+        #expect(!reads.isClosed)
 
         holder.releaseAll()
         #expect(connectionBudget.currentUsage == 0)
         #expect(budget.currentUsage == 0)
-        _ = try channel.finish()
+        decoder.finish()
     }
 }
 
@@ -383,25 +391,34 @@ private final class PeakUsage: @unchecked Sendable {
     var value: Int { lock.withLock { peak } }
 }
 
-private final class ReadCounter: ChannelOutboundHandler, @unchecked Sendable {
-    typealias OutboundIn = ByteBuffer
-    private(set) var count = 0
+private final class ReadCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests = 0
+    private var didClose = false
 
-    func read(context: ChannelHandlerContext) {
-        count += 1
-        context.read()
-    }
+    func requested() { lock.withLock { requests += 1 } }
+    func closed() { lock.withLock { didClose = true } }
+    var count: Int { lock.withLock { requests } }
+    var isClosed: Bool { lock.withLock { didClose } }
 }
 
-private final class FrameHolder: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = InboundFrame
+private final class PausedReports: @unchecked Sendable {
+    private let lock = NSLock()
+    private var reports: [Int] = []
+
+    func append(_ carryOverBytes: Int) { lock.withLock { reports.append(carryOverBytes) } }
+    var values: [Int] { lock.withLock { reports } }
+}
+
+private final class FrameHolder: @unchecked Sendable {
     private(set) var frames: [InboundFrame] = []
     private(set) var delivered: [Data] = []
 
-    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        let frame = unwrapInboundIn(data)
-        frames.append(frame)
-        delivered.append(frame.bytes)
+    func take(from decoder: SessionFrameDecoder) {
+        for frame in decoder.takeFramesForTesting() {
+            frames.append(frame)
+            delivered.append(frame.bytes)
+        }
     }
 
     func releaseFirst() { frames.removeFirst() }

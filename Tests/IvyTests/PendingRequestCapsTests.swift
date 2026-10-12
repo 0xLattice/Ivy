@@ -158,7 +158,7 @@ struct PendingRequestCapsTests {
             loopbacks.append(loopback)
             try await node.seedConnectedEndpointForTesting(
                 endpoint,
-                connection: PeerConnection(endpoint: endpoint, channel: loopback.client),
+                connection: PeerConnection(endpoint: endpoint, stream: NIOTransportConnection(channel: loopback.client)),
                 marker: UInt8(index + 1))
         }
 
@@ -224,7 +224,7 @@ struct PendingRequestCapsTests {
         try await node.start()
         try await node.seedConnectedEndpointForTesting(
             endpoint,
-            connection: PeerConnection(endpoint: endpoint, channel: loopback.client),
+            connection: PeerConnection(endpoint: endpoint, stream: NIOTransportConnection(channel: loopback.client)),
             marker: 1
         )
         await node.seedProviderLookupTarget(endpoint)

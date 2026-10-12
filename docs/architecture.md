@@ -8,17 +8,27 @@ caller: authority, validation, storage, protocol meaning
                          |
 Ivy: admission, sessions, routing, content, relay
                          |
-SwiftNIO: direct TCP or configured carrier
+byte streams: built-in TCP, caller-supplied, or configured carrier
 ```
 
 ## Connections
 
-Inbound capacity is reserved by global and netgroup limits before automatic
-reads begin. Rejected sockets cannot buffer protocol input while waiting for the
-Ivy actor. Capacity is a hard cap: Ivy rejects excess peers rather than evicting
+A connection is a `TransportConnection`: an ordered, reliable byte stream to one
+peer that delivers bytes only when asked. Ivy's TCP listener and dialer supply
+such streams, and a caller supplies its own through `reserveInboundAdmission`,
+`accept`, and `connect(to:over:)`. Framing, byte budgets, the handshake, and
+sessions sit above the stream and are the same for all of them. Dialing an
+address taken from routing is TCP only.
+
+Inbound capacity is reserved by global and netgroup limits, keyed on the
+observed address, before anything is requested from a stream. A reservation
+admits one stream of the netgroup it was reserved for, and a stream that
+reports no observed address is refused. A rejected stream
+is never read, so it cannot buffer protocol input while waiting for the Ivy
+actor. Capacity is a hard cap: Ivy rejects excess peers rather than evicting
 an authenticated connection by reputation.
 
-A pending socket is absent from routing, delegates, content, and application
+A pending connection is absent from routing, delegates, content, and application
 messages. Promotion requires a signed transcript over both identities, fresh
 nonces, route binding, and bounded metadata, followed by the initiator's signed
 finish.

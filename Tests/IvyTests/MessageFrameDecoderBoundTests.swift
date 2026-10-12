@@ -1,15 +1,55 @@
 import Foundation
 import NIOCore
-import NIOEmbedded
 import Testing
 @testable import Ivy
 
-private final class SessionFrameCollector: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = InboundFrame
-    private(set) var records: [Data] = []
+private final class SessionFrameCollector: @unchecked Sendable {
+    fileprivate(set) var records: [Data] = []
+}
 
-    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        records.append(unwrapInboundIn(data).bytes)
+/// A decoder fed directly, the way a connection's stream feeds it, with a
+/// consumer that takes each frame as soon as it is decoded.
+private final class DecoderChannel: @unchecked Sendable {
+    private final class State: @unchecked Sendable {
+        private let lock = NSLock()
+        private var closed = false
+        func close() { lock.withLock { closed = true } }
+        var isClosed: Bool { lock.withLock { closed } }
+    }
+
+    let allocator = ByteBufferAllocator()
+    private let state = State()
+    private let collector: SessionFrameCollector
+    private var decoder: SessionFrameDecoder!
+
+    init(
+        maxFrameSize: UInt32,
+        budget: InboundByteBudget,
+        connectionBudget: InboundByteBudget,
+        collector: SessionFrameCollector
+    ) {
+        self.collector = collector
+        let state = state
+        decoder = SessionFrameDecoder(
+            maxFrameSize: maxFrameSize,
+            budget: budget,
+            connectionBudget: connectionBudget,
+            requestBytes: {},
+            close: { state.close() })
+        decoder.start()
+    }
+
+    var isActive: Bool { !state.isClosed }
+
+    func writeInbound(_ buffer: ByteBuffer) throws {
+        decoder.receive(Data(buffer.readableBytesView))
+        collector.records.append(contentsOf: decoder.takeFramesForTesting().map(\.bytes))
+    }
+
+    @discardableResult
+    func finish() throws -> Bool {
+        decoder.finish()
+        return true
     }
 }
 
@@ -20,16 +60,14 @@ struct MessageFrameDecoderBoundTests {
     private func channel(
         budget: InboundByteBudget = InboundByteBudget(limit: Int(Self.limit) + 4),
         connectionBudget: InboundByteBudget? = nil
-    ) throws -> (EmbeddedChannel, SessionFrameCollector) {
+    ) throws -> (DecoderChannel, SessionFrameCollector) {
         let collector = SessionFrameCollector()
-        let channel = EmbeddedChannel()
-        try channel.pipeline.addHandler(SessionFrameDecoder(
+        let channel = DecoderChannel(
             maxFrameSize: Self.limit,
             budget: budget,
             connectionBudget: connectionBudget
-                ?? InboundByteBudget(limit: 2 * Int(Self.limit) + 4))).wait()
-        try channel.pipeline.addHandler(collector).wait()
-        try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 4001)).wait()
+                ?? InboundByteBudget(limit: 2 * Int(Self.limit) + 4),
+            collector: collector)
         return (channel, collector)
     }
 

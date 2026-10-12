@@ -4,8 +4,8 @@ Authentication proves a peer key, never application authority.
 
 | ID | Law |
 | --- | --- |
-| IVY-001 | Inbound capacity is reserved before protocol reads begin. |
-| IVY-002 | Pending sockets are invisible to routing, delegates, content, and application messages. |
+| IVY-001 | Inbound capacity is reserved before protocol reads begin, keyed on the address the peer was observed at; a stream that reports none is refused unread. |
+| IVY-002 | Pending connections are invisible to routing, delegates, content, and application messages. |
 | IVY-003 | Promotion requires the complete route-bound signed handshake and bounded canonical metadata. |
 | IVY-004 | Accepted records bind sender, receiver, session, sequence, and payload; sequences never replay or wrap. |
 | IVY-005 | Duplicate sessions for one peer and role converge on the smaller session ID. |
@@ -29,5 +29,5 @@ Authentication proves a peer key, never application authority.
 Primary coverage: `SessionProtocolTests`, `IvyTopologyTests`,
 `InboundAdmissionTests`, `MessageFrameDecoderBoundTests`,
 `ContentExchangeTests`, `PendingRequestCapsTests`, `ProviderRefreshTests`,
-`ProviderSuppressionTests`, `RoutingIngressHardeningTests`, `RelayIntegrationTests`, and
-`TCPIntegrationTests`.
+`ProviderSuppressionTests`, `RoutingIngressHardeningTests`, `RelayIntegrationTests`,
+`TransportSeamTests`, and `TCPIntegrationTests`.
