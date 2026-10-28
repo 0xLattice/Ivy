@@ -8,7 +8,7 @@ let package = Package(
         .library(name: "Ivy", targets: ["Ivy"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/adalinxx/Tally.git", from: "3.1.0"),
+        .package(url: "https://github.com/0xLattice/Tally.git", from: "3.1.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
     ],
